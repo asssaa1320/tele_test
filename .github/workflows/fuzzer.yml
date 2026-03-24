@@ -1,0 +1,274 @@
+name: Chromium Semantic Fuzzer — AI-Powered
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Number of fuzz iterations'
+        required: false
+        default: '50'
+        type: string
+      dry_run:
+        description: 'Dry run (generate HTMLs only, no browser)'
+        required: false
+        default: 'false'
+        type: boolean
+
+# Cancel older runs if a new one starts
+concurrency:
+  group: fuzzer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Generate fuzz HTMLs
+  # ─────────────────────────────────────────────
+  generate:
+    name: 🧬 Generate Fuzz Corpus
+    runs-on: ubuntu-latest
+    outputs:
+      html_count: ${{ steps.gen.outputs.html_count }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Generate fuzz HTMLs (dry-run mode)
+        id: gen
+        run: |
+          ITERS="${{ github.event.inputs.iterations || '50' }}"
+          python3 fuzzer/fuzzer.py --iterations "$ITERS" --dry-run
+          COUNT=$(ls fuzz_output/*.html 2>/dev/null | wc -l)
+          echo "html_count=$COUNT" >> $GITHUB_OUTPUT
+          echo "Generated $COUNT HTML files"
+
+      - name: Upload fuzz corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: fuzz_output/
+          retention-days: 3
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Run fuzzer with headless Chromium
+  # ─────────────────────────────────────────────
+  fuzz:
+    name: 🔥 Run Fuzzer (ASan Mode)
+    runs-on: ubuntu-latest
+    needs: generate
+    timeout-minutes: 55
+    strategy:
+      matrix:
+        shard: [1, 2, 3]   # parallel shards
+      fail-fast: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            xvfb \
+            libnss3 \
+            libatk1.0-0 \
+            libatk-bridge2.0-0 \
+            libcups2 \
+            libdrm2 \
+            libxkbcommon0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxrandr2 \
+            libgbm1 \
+            libasound2 \
+            curl \
+            wget
+
+      - name: Download pre-built ASan Chromium
+        run: |
+          mkdir -p chromium_asan
+          # Download latest ASan build from Chromium's storage
+          # (In production: use your own pinned build hash)
+          REVISION=$(curl -s https://www.googleapis.com/storage/v1/b/chromium-browser-asan/o?prefix=linux-release/asan-linux-release | python3 -c "
+          import sys,json
+          data=json.load(sys.stdin)
+          items=data.get('items',[])
+          if items: print(items[-1]['name'])
+          " 2>/dev/null || echo "")
+
+          if [ -z "$REVISION" ]; then
+            echo "⚠️  Could not fetch ASan build, using system Chromium"
+            sudo apt-get install -y chromium-browser
+            export CHROMIUM_BIN=$(which chromium-browser)
+          else
+            gsutil -q cp "gs://chromium-browser-asan/$REVISION" chromium_asan/chrome.zip || true
+            if [ -f chromium_asan/chrome.zip ]; then
+              unzip -q chromium_asan/chrome.zip -d chromium_asan/
+              chmod +x chromium_asan/chrome
+              export CHROMIUM_BIN=$(pwd)/chromium_asan/chrome
+            else
+              sudo apt-get install -y chromium-browser
+              export CHROMIUM_BIN=$(which chromium-browser)
+            fi
+          fi
+          echo "CHROMIUM_BIN=$CHROMIUM_BIN" >> $GITHUB_ENV
+          echo "Using Chromium: $CHROMIUM_BIN"
+          $CHROMIUM_BIN --version || true
+
+      - name: Download fuzz corpus
+        uses: actions/download-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: fuzz_output/
+
+      - name: Calculate shard range
+        id: shard
+        run: |
+          TOTAL=$(ls fuzz_output/*.html 2>/dev/null | wc -l)
+          SHARD_NUM=${{ matrix.shard }}
+          SHARDS=3
+          START=$(( (SHARD_NUM - 1) * TOTAL / SHARDS ))
+          END=$(( SHARD_NUM * TOTAL / SHARDS ))
+          echo "start=$START" >> $GITHUB_OUTPUT
+          echo "end=$END"     >> $GITHUB_OUTPUT
+          echo "Shard $SHARD_NUM: files $START to $END of $TOTAL"
+
+      - name: Run fuzzer on shard
+        env:
+          ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:symbolize=1:handle_segv=1:handle_abort=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=0"
+        run: |
+          START=${{ steps.shard.outputs.start }}
+          END=${{ steps.shard.outputs.end }}
+          SHARD=${{ matrix.shard }}
+          HTMLS=(fuzz_output/*.html)
+          CRASHED=0
+          TOTAL=0
+
+          mkdir -p crashes logs
+
+          for i in "${!HTMLS[@]}"; do
+            if [ "$i" -lt "$START" ] || [ "$i" -ge "$END" ]; then
+              continue
+            fi
+            HTML="${HTMLS[$i]}"
+            BASENAME=$(basename "$HTML" .html)
+            LOG="logs/${BASENAME}.log"
+            TOTAL=$((TOTAL + 1))
+
+            echo "▶ [$TOTAL] $BASENAME"
+
+            # Run with timeout
+            timeout 10 xvfb-run --auto-servernum $CHROMIUM_BIN \
+              --no-sandbox \
+              --disable-dev-shm-usage \
+              --disable-gpu \
+              --headless=new \
+              --run-all-compositor-stages-before-draw \
+              --virtual-time-budget=4000 \
+              --js-flags="--expose-gc --stress-incremental-marking --stress-compaction" \
+              "file://$(pwd)/$HTML" \
+              2>"$LOG" || RC=$?
+
+            # Detect crash
+            if grep -qE "ERROR: AddressSanitizer|ERROR: UndefinedBehavior|Segmentation fault|CHECK failed|DCHECK failed" "$LOG" 2>/dev/null; then
+              CRASHED=$((CRASHED + 1))
+              cp "$HTML" "crashes/CRASH_shard${SHARD}_${BASENAME}.html"
+              cp "$LOG"  "crashes/CRASH_shard${SHARD}_${BASENAME}.log"
+              echo "  💥 CRASH DETECTED!"
+            fi
+          done
+
+          echo "SHARD_TOTAL=$TOTAL"     >> $GITHUB_ENV
+          echo "SHARD_CRASHES=$CRASHED" >> $GITHUB_ENV
+          echo "Done: $TOTAL files, $CRASHED crashes"
+
+      - name: Upload crashes (shard ${{ matrix.shard }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crashes-shard-${{ matrix.shard }}
+          path: crashes/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload logs (shard ${{ matrix.shard }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-shard-${{ matrix.shard }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────
+  # JOB 3: AI Analysis + Telegram Report
+  # ─────────────────────────────────────────────
+  report:
+    name: 🤖 AI Analysis & Telegram Report
+    runs-on: ubuntu-latest
+    needs: [generate, fuzz]
+    if: always()   # run even if fuzzer found crashes
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python deps
+        run: |
+          pip install anthropic httpx --quiet
+
+      - name: Download all crash artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: crashes-shard-*
+          path: all_crashes/
+          merge-multiple: true
+
+      - name: Download all log artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: logs-shard-*
+          path: all_logs/
+          merge-multiple: true
+
+      - name: Run AI crash triage + generate Telegram report
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GITHUB_REPO: ${{ github.repository }}
+          FUZZ_ITERATIONS: ${{ github.event.inputs.iterations || '50' }}
+          HTML_COUNT: ${{ needs.generate.outputs.html_count }}
+        run: |
+          python3 fuzzer/ai_reporter.py
+
+      - name: Upload triage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: triage-reports
+          path: triage/
+          retention-days: 30
+          if-no-files-found: ignore
